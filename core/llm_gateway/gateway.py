@@ -7,6 +7,7 @@
 
 import json
 import logging
+import re
 import time
 from collections import deque
 from typing import AsyncGenerator, Any, Callable
@@ -23,6 +24,8 @@ logger = logging.getLogger(__name__)
 class LLMGateway:
     def __init__(self, config: dict):
         self.providers = config.get("providers", [])
+        # 当前供应商 ID，用于剥离自定义供应商的模型前缀（如 'myproxy/gpt-4o'）
+        self.provider_id = config.get("provider_id", "") or ""
         self.default_model = config.get("default_model", "deepseek/deepseek-chat")
         self.fallback_models = config.get("fallback_models", [])
         self.max_retries = config.get("max_retries", 2)
@@ -35,9 +38,10 @@ class LLMGateway:
         # 构建 OpenAI 客户端
         self._client = self._build_client()
 
-    @staticmethod
-    def _strip_provider_prefix(model: str) -> str:
+    def _strip_provider_prefix(self, model: str) -> str:
         """去掉 litellm 风格的 provider 前缀，如 'deepseek/deepseek-chat' -> 'deepseek-chat'"""
+        if self.provider_id and model.startswith(self.provider_id + "/"):
+            return model[len(self.provider_id) + 1:]
         known_prefixes = {
             "deepseek", "openai", "ollama", "zhipu", "dashscope",
             "azure", "anthropic", "cohere", "huggingface", "vertex_ai",
@@ -118,24 +122,12 @@ class LLMGateway:
                     logger.info(f"[LLM] 流式响应开始 model={current_model}")
                     return self._stream_response(response)
 
-                response = await self._client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content or ""
-
-                # 记录 token 使用量
-                if response.usage:
-                    self._record_usage(current_model, response.usage)
-                    usage_info = (
-                        f"prompt_tokens={response.usage.prompt_tokens}, "
-                        f"completion_tokens={response.usage.completion_tokens}"
-                    )
-                else:
-                    usage_info = "usage=N/A"
+                content = await self._create_completion(kwargs, current_model)
 
                 elapsed = time.monotonic() - t0
                 logger.info(
                     f"[LLM] 请求完成 model={current_model}, "
-                    f"耗时={elapsed:.2f}s, "
-                    f"输出长度={len(content)}字符, {usage_info}"
+                    f"耗时={elapsed:.2f}s, 输出长度={len(content)}字符"
                 )
                 return content
 
@@ -143,17 +135,15 @@ class LLMGateway:
                 elapsed = time.monotonic() - t0
                 error_msg = str(e)
 
-                # 检查是否是 response_format 不支持的错误
+                # response_format 不支持时去掉该参数重试；
+                # 模型对 temperature 的限制由 _create_completion 内部兜底
                 if response_format and self._is_response_format_error(e):
                     logger.warning(
                         f"[LLM] response_format 不支持，去掉后重试 model={current_model}"
                     )
                     try:
                         kwargs_no_fmt = {k: v for k, v in kwargs.items() if k != "response_format"}
-                        response = await self._client.chat.completions.create(**kwargs_no_fmt)
-                        content = response.choices[0].message.content or ""
-                        if response.usage:
-                            self._record_usage(current_model, response.usage)
+                        content = await self._create_completion(kwargs_no_fmt, current_model)
                         elapsed = time.monotonic() - t0
                         logger.info(
                             f"[LLM] 降级请求完成(无response_format) model={current_model}, "
@@ -184,6 +174,34 @@ class LLMGateway:
                 continue
 
         raise LLMGatewayError(f"所有重试失败: {last_error}") from last_error
+
+    async def _create_completion(self, kwargs: dict, model: str) -> str:
+        """发起一次补全请求并返回文本。
+
+        模型拒绝 temperature（如只允许 0.6）时，自动改用服务端要求的值重试一次；
+        该兜底对 response_format 降级后的重试同样生效。
+        """
+        try:
+            response = await self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if not self._is_temperature_error(e):
+                raise
+            allowed = self._allowed_temperature(e)
+            retry_kwargs = {k: v for k, v in kwargs.items() if k != "temperature"}
+            if allowed is not None:
+                retry_kwargs["temperature"] = allowed
+                logger.warning(
+                    f"[LLM] temperature={kwargs.get('temperature')} 不被模型接受，"
+                    f"改用 {allowed} 重试 model={model}"
+                )
+            else:
+                logger.warning(f"[LLM] temperature 不被模型接受，去掉该参数重试 model={model}")
+            response = await self._client.chat.completions.create(**retry_kwargs)
+
+        content = response.choices[0].message.content or ""
+        if response.usage:
+            self._record_usage(model, response.usage)
+        return content
 
     async def collect_json(
         self,
@@ -286,6 +304,8 @@ class LLMGateway:
         model_name = model or self._resolved_model
         collected_chunks: list[str] = []
         last_error = None
+        # 部分模型只接受固定 temperature，命中 400 后改为服务端要求的值（None 表示不传）
+        effective_temperature: float | None = temperature
 
         for attempt in range(self.max_retries):
             current_model = self._get_model_for_attempt(attempt, model_name)
@@ -303,13 +323,15 @@ class LLMGateway:
                         f"已收集{len(prefix)}字符, 将请求续写"
                     )
 
-                response = await self._client.chat.completions.create(
-                    model=current_model,
-                    messages=retry_messages,
-                    temperature=temperature,
-                    max_tokens=8192,
-                    stream=True,
-                )
+                stream_kwargs: dict = {
+                    "model": current_model,
+                    "messages": retry_messages,
+                    "max_tokens": 8192,
+                    "stream": True,
+                }
+                if effective_temperature is not None:
+                    stream_kwargs["temperature"] = effective_temperature
+                response = await self._client.chat.completions.create(**stream_kwargs)
                 logger.info(f"[LLM] 流式响应开始 model={current_model}, attempt={attempt+1}")
 
                 # 消费流式响应
@@ -322,6 +344,12 @@ class LLMGateway:
 
             except (APITimeoutError, APIConnectionError, APIError) as e:
                 last_error = e
+                if self._is_temperature_error(e):
+                    effective_temperature = self._allowed_temperature(e)
+                    logger.warning(
+                        "[LLM.stream_chat] temperature 不被模型接受，下次尝试改用 "
+                        f"{effective_temperature if effective_temperature is not None else '不传 temperature'}"
+                    )
                 logger.error(
                     f"[LLM.stream_chat] 流式中断 model={current_model}, "
                     f"attempt={attempt+1}/{self.max_retries}, 已收集{len(collected_chunks)}个chunk, "
@@ -355,17 +383,32 @@ class LLMGateway:
     def _is_response_format_error(error: Exception) -> bool:
         """检查是否是 response_format 不支持的错误"""
         error_str = str(error).lower()
+        # 必须显式提到 response_format / json_object，避免把 temperature 等无关 400 误判
         return any(
             keyword in error_str
             for keyword in [
                 "response_format",
+                "response format",
                 "json_object",
                 "json mode",
-                "not supported",
-                "unsupported parameter",
-                "invalid_request_error",
             ]
         )
+
+    @staticmethod
+    def _is_temperature_error(error: Exception) -> bool:
+        """部分模型只接受固定 temperature（如 Kimi K2 只允许 0.6），服务端回 400。"""
+        message = str(error).lower()
+        if "temperature" not in message:
+            return False
+        return getattr(error, "status_code", None) == 400 or "400" in message
+
+    @staticmethod
+    def _allowed_temperature(error: Exception) -> float | None:
+        """从错误信息里提取服务端要求的 temperature，如 'only 0.6 is allowed'。"""
+        match = re.search(
+            r"only\s+([0-9]+(?:\.[0-9]+)?)\s+is\s+allowed", str(error), re.IGNORECASE
+        )
+        return float(match.group(1)) if match else None
 
     async def _stream_response(self, response) -> AsyncGenerator[str, None]:
         """流式响应处理，带错误恢复。
@@ -445,27 +488,47 @@ class LLMGateway:
                 response = await self._client.chat.completions.create(**kwargs)
                 msg = response.choices[0].message
                 self._record_usage(current_model, response.usage)
-
-                if msg.tool_calls:
-                    calls = []
-                    for tc in msg.tool_calls:
-                        calls.append(ToolCallItem(
-                            id=tc.id,
-                            function_name=tc.function.name,
-                            arguments=tc.function.arguments,
-                        ))
-                    return ToolCallResponse(
-                        has_tool_calls=True,
-                        tool_calls=calls,
-                        content=msg.content or "",
-                    )
-                return ToolCallResponse(
-                    has_tool_calls=False,
-                    content=msg.content or "",
-                )
+                return self._build_tool_response(msg)
             except Exception as e:
                 last_error = e
+                if self._is_temperature_error(e):
+                    allowed = self._allowed_temperature(e)
+                    if allowed is not None:
+                        kwargs["temperature"] = allowed
+                    else:
+                        kwargs.pop("temperature", None)
+                    logger.warning(
+                        "[LLM.chat_with_tools] temperature 不被模型接受，改用 "
+                        f"{allowed if allowed is not None else '不传 temperature'} 重试"
+                    )
+                    try:
+                        response = await self._client.chat.completions.create(**kwargs)
+                        self._record_usage(current_model, response.usage)
+                        return self._build_tool_response(response.choices[0].message)
+                    except Exception as retry_err:
+                        last_error = retry_err
                 logger.error(f"[LLM.chat_with_tools] 失败 attempt={attempt+1}: {e}")
                 continue
 
         raise LLMGatewayError(f"chat_with_tools 所有重试失败: {last_error}") from last_error
+
+    @staticmethod
+    def _build_tool_response(msg) -> ToolCallResponse:
+        if msg.tool_calls:
+            calls = [
+                ToolCallItem(
+                    id=tc.id,
+                    function_name=tc.function.name,
+                    arguments=tc.function.arguments,
+                )
+                for tc in msg.tool_calls
+            ]
+            return ToolCallResponse(
+                has_tool_calls=True,
+                tool_calls=calls,
+                content=msg.content or "",
+            )
+        return ToolCallResponse(
+            has_tool_calls=False,
+            content=msg.content or "",
+        )

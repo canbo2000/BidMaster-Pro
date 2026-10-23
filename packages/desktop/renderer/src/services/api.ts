@@ -478,6 +478,7 @@ export const llmApi = {
   setDefaultModel: (config: Record<string, string>) => api.put('/llm/default-model', config),
 
   listConfigs: () => api.get('/llm/configs'),
+  fetchModels: (payload: Record<string, unknown>) => api.post('/llm/models', payload),
   revealConfigKey: (configId: string) => api.get(`/llm/configs/${configId}/reveal`),
   createConfig: (payload: Record<string, unknown>) => api.post('/llm/configs', payload),
   updateConfig: (configId: string, payload: Record<string, unknown>) => api.put(`/llm/configs/${configId}`, payload),
@@ -681,9 +682,21 @@ export const rbacApi = {
 };
 
 export const aiImageApi = {
-  generate: (prompt: string, provider: string = 'default', imageSize: string = 'landscape_16_9') =>
-    api.post('/ai-image/generate', { prompt, provider, image_size: imageSize }, { timeout: 120000 }),
+  generate: (
+    prompt: string,
+    provider: string = 'default',
+    imageSize: string = 'landscape_16_9',
+    extra?: { model?: string; api_base?: string; api_key?: string },
+  ) =>
+    api.post('/ai-image/generate', { prompt, provider, image_size: imageSize, ...extra }, { timeout: 120000 }),
   listProviders: () => api.get('/ai-image/providers'),
+  saveProvider: (payload: {
+    provider_id: string;
+    display_name?: string;
+    model?: string;
+    api_base?: string;
+    api_key?: string;
+  }) => api.post('/ai-image/providers', payload),
   saveConfig: (provider: string, apiKey: string) => api.put('/ai-image/config', { provider, api_key: apiKey }),
 };
 
